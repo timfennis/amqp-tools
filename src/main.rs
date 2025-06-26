@@ -1,7 +1,7 @@
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::{Args, Parser, Subcommand, arg};
 use dirs::config_dir;
-use lapin::options::{BasicGetOptions, BasicRejectOptions};
+use lapin::options::{BasicAckOptions, BasicGetOptions, BasicRejectOptions};
 use lapin::uri::{AMQPAuthority, AMQPScheme, AMQPUri, AMQPUserInfo};
 use lapin::{Connection, ConnectionProperties};
 use serde::Deserialize;
@@ -21,7 +21,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Read one or more messages from the queue (this removes the message)
     Read(ReadArgs),
+    /// Peek at the head of the queue, leaving the head in place
+    Peek(PeekArgs),
 }
 
 #[derive(Args, Debug)]
@@ -34,16 +37,23 @@ struct ReadArgs {
     #[arg()]
     queue_name: String,
 
-    /// Requeue the message after reading instead of acknowledging it.
-    #[arg(long)]
-    requeue: bool,
-
     /// The maximum number of messages to read.
-    #[arg(long, short, default_value_t = 1)]
-    limit: u32,
+    #[arg(long, short)]
+    limit: Option<u32>,
 
     #[arg(long, short)]
     output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct PeekArgs {
+    /// A connection name defined in the application config (other options will be ignored)
+    #[arg(short, long, global = true)]
+    connection: Option<String>,
+
+    /// The name of the queue to read from.
+    #[arg()]
+    queue_name: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -103,16 +113,32 @@ impl Into<AMQPUri> for &Config {
 }
 
 fn open_output_file<D: Display>(path: &PathBuf, offset: D) -> std::io::Result<File> {
-    if path.is_dir() {
+    if path.is_dir() || path.to_string_lossy().ends_with("/") {
+        std::fs::create_dir_all(path)?;
         let file_path = path.join(format!("message_{offset}"));
         File::create(file_path)
+    } else if path.is_file() {
+        File::open(path)
     } else {
-        if std::fs::exists(path)? {
-            File::open(path)
-        } else {
-            File::create(path)
-        }
+        File::create(path)
     }
+}
+
+fn get_uri_from_config(name: &str) -> anyhow::Result<AMQPUri> {
+    let config_map = Config::from_file(&Config::ensure_file_exists()?)?;
+    config_map
+        .get(name)
+        .ok_or(anyhow!("connection \"{name}\" does not exist in config"))
+        .map(Into::into)
+}
+
+async fn create_connection_by_name(name: Option<&str>) -> anyhow::Result<Connection> {
+    let uri = name
+        .map(get_uri_from_config)
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(Connection::connect_uri(uri, ConnectionProperties::default()).await?)
 }
 
 #[tokio::main]
@@ -121,57 +147,61 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Read(args) => {
-            let uri = if let Some(connection_name) = args.connection {
-                let config_map = Config::from_file(&Config::ensure_file_exists()?)?;
-                config_map.get(&connection_name).unwrap().into()
-            } else {
-                todo!("you must specify -c for now");
-            };
-
-            let connection = Connection::connect_uri(uri, ConnectionProperties::default()).await?;
-            // Match on the subcommand to execute the correct logic.
+            let connection = create_connection_by_name(args.connection.as_deref()).await?;
             let channel = connection
                 .create_channel()
                 .await
-                .context("Failed to create channel")?;
+                .context("failed to create channel")?;
 
             let mut read_count = 0;
-            'main: for id in 0..args.limit {
-                let message = channel
-                    .basic_get(&args.queue_name, BasicGetOptions::default())
-                    .await
-                    .context("Failed to read message")?;
-
-                if let Some(message) = message {
-                    let mut output: Box<dyn Write> = if let Some(file_name) = &args.output {
-                        Box::new(open_output_file(file_name, id)?)
-                    } else {
-                        Box::new(std::io::stdout())
-                    };
-
-                    read_count += 1;
-
-                    output
-                        .write_all(&message.data)
-                        .context("Failed to write message stdout")?;
-                    output.write(b"\n")?;
-                    output.flush()?;
-
-                    channel
-                        .basic_reject(
-                            message.delivery_tag,
-                            BasicRejectOptions {
-                                requeue: args.requeue,
-                            },
-                        )
-                        .await
-                        .context("failed to nack message")?;
+            while let Some(message) = channel
+                .basic_get(&args.queue_name, BasicGetOptions::default())
+                .await
+                .context("Failed to read message")?
+            {
+                let mut output: Box<dyn Write> = if let Some(file_name) = &args.output {
+                    Box::new(open_output_file(file_name, read_count)?)
                 } else {
-                    break 'main;
+                    Box::new(std::io::stdout())
+                };
+
+                read_count += 1;
+
+                output
+                    .write_all(&message.data)
+                    .context("Failed to write message stdout")?;
+                output.write(b"\n")?;
+                output.flush()?;
+
+                channel
+                    .basic_ack(message.delivery_tag, BasicAckOptions { multiple: false })
+                    .await
+                    .context("failed to ack message")?;
+
+                if read_count >= args.limit.unwrap_or(u32::MAX) {
+                    break;
                 }
             }
 
             eprintln!("Read {read_count} messages from {}", args.queue_name);
+        }
+        Commands::Peek(args) => {
+            let connection = create_connection_by_name(args.connection.as_deref()).await?;
+            let channel = connection.create_channel().await?;
+
+            let message = channel
+                .basic_get(&args.queue_name, BasicGetOptions::default())
+                .await?;
+
+            if let Some(message) = message {
+                std::io::stdout().write_all(&message.data)?;
+
+                channel
+                    .basic_reject(message.delivery_tag, BasicRejectOptions { requeue: true })
+                    .await?;
+            } else {
+                println!("the queue is empty");
+            }
         }
     }
 
