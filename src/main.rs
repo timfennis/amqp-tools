@@ -1,11 +1,7 @@
 use anyhow::{Context, anyhow};
 use clap::{Args, Parser, Subcommand, arg};
 use dirs::config_dir;
-use futures::StreamExt;
-use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, BasicGetOptions, BasicPublishOptions, BasicRejectOptions,
-};
-use lapin::types::FieldTable;
+use lapin::options::{BasicAckOptions, BasicGetOptions, BasicPublishOptions, BasicRejectOptions};
 use lapin::uri::{AMQPAuthority, AMQPScheme, AMQPUri, AMQPUserInfo};
 use lapin::{Connection, ConnectionProperties};
 use serde::Deserialize;
@@ -14,8 +10,6 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-
-const CONSUMER_TAG: &str = "amqp-tools";
 
 /// A CLI tool for interacting with RabbitMQ queues.
 #[derive(Parser)]
@@ -233,30 +227,22 @@ async fn main() -> anyhow::Result<()> {
             let destination = create_connection_by_name(args.source_connection.as_deref()).await?;
             let destination_channel = destination.create_channel().await?;
 
-            let mut consumer = source_channel
-                .basic_consume(
-                    &args.source_queue_name,
-                    CONSUMER_TAG,
-                    BasicConsumeOptions::default(),
-                    FieldTable::default(),
-                )
-                .await?;
-
-            while let Some(delivery) = consumer.next().await {
-                let delivery = delivery?;
-
+            while let Some(msg) = source_channel
+                .basic_get(&args.source_queue_name, BasicGetOptions::default())
+                .await?
+            {
                 destination_channel
                     .basic_publish(
                         "",
                         &args.destination_queue_name,
                         BasicPublishOptions::default(),
-                        &delivery.data,
-                        delivery.properties,
+                        &msg.data,
+                        msg.properties.clone(),
                     )
                     .await?;
 
                 source_channel
-                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                    .basic_ack(msg.delivery_tag, BasicAckOptions::default())
                     .await?;
             }
         }
