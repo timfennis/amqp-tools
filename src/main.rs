@@ -1,7 +1,7 @@
 use anyhow::{Context, anyhow};
 use clap::{Args, Parser, Subcommand, arg};
 use dirs::config_dir;
-use lapin::options::{BasicAckOptions, BasicGetOptions, BasicRejectOptions};
+use lapin::options::{BasicAckOptions, BasicGetOptions, BasicPublishOptions, BasicRejectOptions};
 use lapin::uri::{AMQPAuthority, AMQPScheme, AMQPUri, AMQPUserInfo};
 use lapin::{Connection, ConnectionProperties};
 use serde::Deserialize;
@@ -25,6 +25,8 @@ enum Commands {
     Read(ReadArgs),
     /// Peek at the head of the queue, leaving the head in place
     Peek(PeekArgs),
+    /// Move all messages from the source queue to a destination queue
+    Shovel(ShovelArgs),
 }
 
 #[derive(Args, Debug)]
@@ -54,6 +56,20 @@ struct PeekArgs {
     /// The name of the queue to read from.
     #[arg()]
     queue_name: String,
+}
+#[derive(Args, Debug)]
+struct ShovelArgs {
+    #[arg(short, long)]
+    source_connection: Option<String>,
+
+    #[arg(short, long)]
+    destination_connection: Option<String>,
+
+    #[arg()]
+    source_queue_name: String,
+
+    #[arg()]
+    destination_queue_name: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -201,6 +217,33 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             } else {
                 println!("the queue is empty");
+            }
+        }
+        Commands::Shovel(args) => {
+            // TODO: should we try to figure out that source and destination might be the same server?
+            let source = create_connection_by_name(args.source_connection.as_deref()).await?;
+            let source_channel = source.create_channel().await?;
+
+            let destination = create_connection_by_name(args.source_connection.as_deref()).await?;
+            let destination_channel = destination.create_channel().await?;
+
+            while let Some(msg) = source_channel
+                .basic_get(&args.source_queue_name, BasicGetOptions::default())
+                .await?
+            {
+                destination_channel
+                    .basic_publish(
+                        "",
+                        &args.destination_queue_name,
+                        BasicPublishOptions::default(),
+                        &msg.data,
+                        msg.properties.clone(),
+                    )
+                    .await?;
+
+                source_channel
+                    .basic_ack(msg.delivery_tag, BasicAckOptions::default())
+                    .await?;
             }
         }
     }
