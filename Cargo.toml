@@ -12,3 +12,4 @@ lapin = "3.0.0"
 serde = { version = "1.0.219", features = ["derive"] }
 tokio = { version = "1.45.1", features = ["full"] }
 toml = "0.8.23"
+url = { version = "2.5.4", features = ["serde"] }

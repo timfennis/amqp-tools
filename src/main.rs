@@ -10,6 +10,8 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use lapin::uri::AMQPScheme::AMQP;
+use url::Url;
 
 /// A CLI tool for interacting with RabbitMQ queues.
 #[derive(Parser)]
@@ -73,7 +75,14 @@ struct ShovelArgs {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct Config {
+#[serde(untagged)]
+enum ConfigEntry {
+    Expanded(ExpandedEntry),
+    Url { url: Url },
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct ExpandedEntry {
     username: String,
     password: String,
     port: u16,
@@ -82,7 +91,7 @@ struct Config {
     vhost: String,
 }
 
-impl Config {
+impl ConfigEntry {
     pub fn ensure_file_exists() -> anyhow::Result<PathBuf> {
         let mut config_file = config_dir().context("cannot obtain config dir")?;
         (config_file).push("amqp-tools");
@@ -106,24 +115,30 @@ impl Config {
     }
 }
 
-impl Into<AMQPUri> for &Config {
-    fn into(self) -> AMQPUri {
-        AMQPUri {
-            scheme: if self.secure {
-                AMQPScheme::AMQPS
-            } else {
-                AMQPScheme::AMQP
-            },
-            authority: AMQPAuthority {
-                userinfo: AMQPUserInfo {
-                    username: self.username.to_string(),
-                    password: self.password.to_string(),
-                },
-                host: self.host.to_string(),
-                port: self.port,
-            },
-            vhost: self.vhost.to_string(),
-            query: Default::default(),
+impl TryInto<AMQPUri> for &ConfigEntry {
+    type Error = String;
+
+    fn try_into(self) -> Result<AMQPUri, Self::Error> {
+        match self {
+            ConfigEntry::Expanded(e) =>
+                Ok(AMQPUri {
+                    scheme: if e.secure {
+                        AMQPScheme::AMQPS
+                    } else {
+                        AMQPScheme::AMQP
+                    },
+                    authority: AMQPAuthority {
+                        userinfo: AMQPUserInfo {
+                            username: e.username.to_string(),
+                            password: e.password.to_string(),
+                        },
+                        host: e.host.to_string(),
+                        port: e.port,
+                    },
+                    vhost: e.vhost.to_string(),
+                    query: Default::default(),
+                }),
+            ConfigEntry::Url { url} => url.as_str().parse(),
         }
     }
 }
@@ -141,11 +156,11 @@ fn open_output_file<D: Display>(path: &PathBuf, offset: D) -> std::io::Result<Fi
 }
 
 fn get_uri_from_config(name: &str) -> anyhow::Result<AMQPUri> {
-    let config_map = Config::from_file(&Config::ensure_file_exists()?)?;
+    let config_map = ConfigEntry::from_file(&ConfigEntry::ensure_file_exists()?)?;
     config_map
         .get(name)
         .ok_or(anyhow!("connection \"{name}\" does not exist in config"))
-        .map(Into::into)
+        .and_then(|x| x.try_into().map_err(|_| anyhow!("failed to parse config")))
 }
 
 async fn create_connection_by_name(name: Option<&str>) -> anyhow::Result<Connection> {
@@ -224,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
             let source = create_connection_by_name(args.source_connection.as_deref()).await?;
             let source_channel = source.create_channel().await?;
 
-            let destination = create_connection_by_name(args.source_connection.as_deref()).await?;
+            let destination = create_connection_by_name(args.destination_connection.as_deref()).await?;
             let destination_channel = destination.create_channel().await?;
 
             while let Some(msg) = source_channel
@@ -244,6 +259,8 @@ async fn main() -> anyhow::Result<()> {
                 source_channel
                     .basic_ack(msg.delivery_tag, BasicAckOptions::default())
                     .await?;
+
+                eprintln!("Moved 1 message from source to destination");
             }
         }
     }
